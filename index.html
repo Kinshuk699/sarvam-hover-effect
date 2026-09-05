@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Song Sea v6 — Sarvam-exact WebGL ASCII Cloth</title>
+<style>
+  @font-face {
+    font-family: 'Space Mono Local';
+    src: url('assets/space-mono-400.woff2') format('woff2');
+    font-weight: 400; font-style: normal; font-display: block;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; }
+  body { background: #fffeec; font-family: 'Space Mono Local', monospace; }
+  canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: block; }
+  .hud { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 5; font-family: 'Space Mono Local', monospace; }
+  .hud .title { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #1a1a1a; background: rgba(255,254,236,.85); border: 1px solid rgba(0,0,0,.15); padding: 6px 10px; border-radius: 4px; backdrop-filter: blur(4px); }
+#cursor-dot { position: fixed; width: 12px; height: 12px; border-radius: 50%; border: 2px solid #ff00ff; background: rgba(255,0,255,.25); transform: translate(-50%, -50%); pointer-events: none; z-index: 6; display: none; }
+  button { font-family: 'Space Mono Local', monospace; font-size: 11px; letter-spacing: .15em; text-transform: uppercase; padding: 6px 12px; border-radius: 4px; cursor: pointer; border: 1px solid #1a1a1a; background: #fffeec; color: #1a1a1a; transition: all .15s; }
+  button:hover { transform: translateY(-1px); }
+  .hint { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); font-size: 10px; letter-spacing: .2em; text-transform: uppercase; color: rgba(0,0,0,.45); z-index: 5; pointer-events: none; text-align: center; max-width: 92vw; line-height: 1.8; }
+</style>
+</head>
+<body>
+<canvas id="sea"></canvas>
+<div id="cursor-dot"></div>
+<div id="grid-outline" style="position:fixed; top:0; left:0; border:2px dashed #00ffff; pointer-events:none; z-index:4;"></div>
+<div id="errbar" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:#1a1a1a; color:#fffeec; font:12px 'Space Mono Local',monospace; letter-spacing:.1em; padding:18px 24px; z-index:99; max-width:80vw; text-align:center;"></div>
+<div class="hud">
+  <span class="title">v6 · ascii cloth — sarvam-exact</span>
+  <button id="reset">reset</button>
+</div>
+<div class="hint">hover = petals sprout outward from your cursor &amp; rise in 3D · click = nothing</div>
+
+<script>
+(() => {
+'use strict';
+
+/* ════════════════════════════════════════════════════════════════
+   v6 — Sarvam-exact pipeline:
+   art  : seeded painterly landscape (their palette, sampled from their canvas)
+   grid : dense ASCII cells — solid color stitch + glyph overlay (luminance ramp)
+   phys : cloth springs (their config: spring 14, radius 80) — CPU
+   gfx  : WebGL2 instanced quads, sheen + ply + edgeShade in shader (their look)
+   input: enter=wake, move=stir, down=press+ripple, up=release, leave=settle,
+          click = NOTHING (verbatim their wrapper)
+   ════════════════════════════════════════════════════════════════ */
+
+const CELL = 8;                 // px per stitch (their cell size)
+const RADIUS = 80;              // their radius
+const SPRING_HOME = 50;         // their spring 14, translated to s^-2 units
+const SPRING_EDGE = 160;
+const EDGE_DAMP = 3.5;
+const DAMP = 6.0;
+const BLEND_INJECT = 0.5;
+const SWIRL = 0.35;
+const V_MAX = 400;
+const RIPPLE_LIFE = 0.45;       // s
+const RIPPLE_SPEED = 260;       // px/s
+const RIPPLE_AMP = 9;           // gentle — NOT a burst
+const SEW_STAGGER = 0.0035;     // s per column (ltr)
+const SEW_DURATION = 0.25;      // s per cell
+
+const PALETTE = [  // sampled from their canvas (Sep 2026)
+  [30,46,24],    // #1e2e18 deepest canopy
+  [32,50,26],    // #20321a
+  [31,48,25],    // #1f301a
+  [47,50,35],    // #2f5023
+  [46,78,34],    // #2e4e22
+  [69,113,48],   // #457131
+  [68,114,48],   // #447230
+  [116,169,71],  // #74a947
+  [206,232,235], // #cee8eb cream horizon
+  [255,255,255], // #ffffff sparkle
+  [50,58,48],    // #323a30 dark speck
+  [39,96,108],   // #27606c teal
+  [25,57,71],    // #193947 deep teal
+  [50,125,137],  // #327d89
+  [39,95,107]    // #275f6b
+];
+const GLYPHS = ['·', ':', '-', '=', '+', '*', '#', '%', '@'];   // 9-level ASCII ramp (no space: full density)
+const BG = [255, 254, 236];
+
+/* seeded RNG + value noise */
+function mulberry32(a) { return function() { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function makeNoise2(seed) {
+  const rnd = mulberry32(seed);
+  const perm = new Uint8Array(512);
+  const p = new Uint8Array(256).map((_, i) => i);
+  for (let i = 255; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  const grad = (h, x, y) => { switch (h & 3) { case 0: return x + y; case 1: return -x + y; case 2: return x - y; default: return -x - y; } };
+  const fade = (t) => t * t * (3 - 2 * t);
+  return (x, y) => {
+    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+    const xf = x - Math.floor(x), yf = y - Math.floor(y);
+    const u = fade(xf), v = fade(yf);
+    const aa = perm[perm[X] + Y], ab = perm[perm[X] + Y + 1], ba = perm[perm[X + 1] + Y], bb = perm[perm[X + 1] + Y + 1];
+    const g1 = grad(aa, xf, yf), g2 = grad(ba, xf - 1, yf), g3 = grad(ab, xf, yf - 1), g4 = grad(bb, xf - 1, yf - 1);
+    const l1 = g1 + u * (g2 - g1), l2 = g3 + u * (g4 - g3);
+    return l1 + v * (l2 - l1);
+  };
+}
+function fbm(noise, x, y, oct) {
+  let v = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { v += amp * noise(x * f, y * f); amp *= 0.5; f *= 2.03; }
+  return v;
+}
+
+/* ═══════════ landscape generation: canopy → cream horizon → water ═══════════ */
+let cols = 0, rows = 0;
+let cells = [];       // {r,g,b, glyph, rand, rx, ry, x, y, vx, vy, sew, sewStart}
+let basePos = null;   // Float32Array base coords
+let disp = null;      // Float32Array displacements (current - base)
+let colors = null;    // Float32Array rgb
+let glyphIdx = null;  // Float32Array glyph uv offsets
+let rands = null;     // Float32Array random phase
+let sewArr = null;    // Float32Array sew progress
+let liftArr = null;   // Float32Array pointer-proximity lift (3D sprout)
+let liftOx = null;    // Float32Array outward push x (feather ruffle)
+let liftOy = null;    // Float32Array outward push y
+
+function genArt(seed) {
+  const noise = makeNoise2(seed);
+  const rnd = mulberry32(seed * 7 + 13);
+  const W = cols, H = rows;
+  cells.length = 0;
+  const n = W * H;
+  basePos = new Float32Array(n * 2);
+  disp = new Float32Array(n * 2);
+  colors = new Float32Array(n * 3);
+  glyphIdx = new Float32Array(n);
+  rands = new Float32Array(n);
+  sewArr = new Float32Array(n).fill(1);
+  liftArr = new Float32Array(n);
+  liftOx = new Float32Array(n);
+  liftOy = new Float32Array(n);
+
+  let k = 0;
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const nx = c / W, ny = r / H;
+      // terrain bands: canopy top, horizon ~45%, water below (their composition)
+      const horizon = 0.42 + fbm(noise, nx * 3.2, ny * 1.6, 3) * 0.07;
+      const canopyN = fbm(noise, nx * 5 + 40, ny * 6, 4);
+      const waterN = fbm(noise, nx * 6 + 200, ny * 4, 3);
+      let idx;
+      if (ny < horizon) {
+        // canopy: depth by ny — darker at top, lighter near horizon
+        const t = ny / horizon;
+        const v = t * 0.85 + canopyN * 0.25;
+        idx = v < 0.25 ? 0 : v < 0.45 ? 1 : v < 0.6 ? 3 : v < 0.75 ? 5 : v < 0.9 ? 6 : 7;
+        // sparse leaf sparkles
+        if (rnd() < 0.02) idx = 7;
+      } else if (ny < horizon + 0.05) {
+        // cream horizon band — mostly cream with soft dither
+        idx = rnd() < 0.8 ? 8 : (rnd() < 0.5 ? 9 : 10);
+      } else {
+        // water: deeper = darker; horizontal shimmer lines
+        const t = (ny - horizon - 0.05) / (1 - horizon - 0.05);
+        const shimmer = Math.sin(ny * 90 + fbm(noise, nx * 8, ny * 2.2, 2) * 6) * 0.5 + 0.5;
+        const v = t * 0.8 + waterN * 0.22 - shimmer * 0.14;
+        idx = v < 0.3 ? 12 : v < 0.5 ? 14 : v < 0.68 ? 11 : 13;
+        if (rnd() < 0.012) idx = 9;   // rare white caps
+      }
+      const p = PALETTE[idx];
+      const jit = 0.96 + rnd() * 0.08;   // subtle per-stitch brightness (fabric)
+      colors[k * 3] = Math.min(255, p[0] * jit);
+      colors[k * 3 + 1] = Math.min(255, p[1] * jit);
+      colors[k * 3 + 2] = Math.min(255, p[2] * jit);
+      // glyph by darkness of the base color
+      const lum = (0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2]) / 255;
+      const gi = Math.max(0, Math.min(GLYPHS.length - 1, Math.round((1 - lum) * (GLYPHS.length - 1))));
+      glyphIdx[k] = gi;
+      rands[k] = rnd() * 6.2832;
+      basePos[k * 2] = c * CELL;
+      basePos[k * 2 + 1] = r * CELL;
+      cells.push({ idx: k });
+      k++;
+    }
+  }
+  disp.fill(0);
+}
+
+/* ═══════════ WebGL2 instanced renderer ═══════════ */
+const cvs = document.getElementById('sea');
+const errbar = document.getElementById('errbar');
+function showErr(msg) {
+  errbar.style.display = 'block';
+  errbar.textContent = 'ERROR: ' + msg;
+  window.__fatal = msg;
+}
+const gl = cvs.getContext('webgl2', { antialias: false, alpha: true, premultipliedAlpha: false });
+if (!gl) showErr('WebGL2 not available in this viewer — open index.html in Chrome/Safari/Firefox.');
+let prog, vao, instBuf, atlasTex, uRes, uWake, uCell, uAtlasSize, uPtr;
+
+function buildAtlas() {
+  const gcount = GLYPHS.length;
+  const s = 28;
+  const ac = document.createElement('canvas');
+  ac.width = gcount * s; ac.height = s;
+  const a2 = ac.getContext('2d');
+  a2.clearRect(0, 0, ac.width, ac.height);
+  a2.font = '22px "Space Mono Local", monospace';
+  a2.textBaseline = 'middle';
+  a2.textAlign = 'center';
+  a2.fillStyle = '#ffffff';
+  for (let i = 0; i < gcount; i++) a2.fillText(GLYPHS[i], i * s + s / 2, s / 2 + 2);
+  atlasTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, ac.width, ac.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, ac);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return gcount;
+}
+
+const VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aBase;    // base cell pos (px)
+layout(location=1) in vec2 aDisp;    // cloth displacement (px)
+layout(location=2) in vec3 aColor;   // cell color 0..255
+layout(location=3) in float aGlyph;  // glyph index
+layout(location=4) in float aSew;    // sew progress
+layout(location=5) in float aRand;   // random phase
+layout(location=6) in float aLift;   // pointer-proximity lift (3D sprout)
+layout(location=7) in vec2 aLiftOut; // outward feather push (px)
+uniform vec2 uRes;
+uniform float uCell;
+uniform vec2 uPtr;    // pointer position (hover bloom center)
+out vec2 vUv;         // local cell uv 0..1
+out vec3 vColor;
+out float vGlyph;
+out float vSew;
+out float vRand;
+out float vLift;
+out float vRuff;
+void main() {
+  vec2 p = aBase + aDisp;
+  // unit quad from gl_VertexID (triangle strip)
+  vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  // per-tile ruffle: mild variation so petals don't rise as a rigid wall
+  float ruff = 0.6 + 0.4 * sin(aRand * 3.7 + 1.3);
+  // petals sprout OUTWARD from the CURSOR: orientation = radial from the pointer
+  vec2 toPtr = (p + vec2(uCell * 0.5)) - uPtr;
+  float bd = length(toPtr);
+  vec2 dir = bd > 0.001 ? toPtr / bd : vec2(0.0, 1.0);
+  float ang = atan(dir.y, dir.x) + (aRand - 0.5) * 0.6;
+  mat2 R = mat2(cos(ang), -sin(ang), sin(ang), cos(ang));
+  // leaf: elongates along the radial as it lifts, shrinks across
+  vec2 leafSize = vec2(1.0 + aLift * 1.5, 1.0 - aLift * 0.30);
+  vec2 local = R * ((corner - 0.5) * uCell * (1.0 - aLift * 0.12) * leafSize);
+  // push outward along the radial (petals opening) + rise
+  vec2 center = p + dir * aLift * 4.0 + vec2(uCell * 0.5);
+  // 3D pitch: the far edge (away from bloom) rises more -> rectangle tilts up
+  float pitch = dot(corner - 0.5, dir) * aLift * 7.0;
+  vec2 ndc = ((center + local - vec2(0.0, aLift * 2.0 + pitch)) / uRes) * 2.0 - 1.0;
+  ndc.y = -ndc.y;   // GL y grows upward; art rows are top-down
+  vRuff = ruff;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  vUv = corner;
+  vColor = aColor / 255.0;
+  vGlyph = aGlyph;
+  vSew = aSew;
+  vRand = aRand;
+  vLift = aLift;
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+in vec2 vUv;
+in vec3 vColor;
+in float vGlyph;
+in float vSew;
+in float vRand;
+in float vLift;
+in float vRuff;
+uniform sampler2D uAtlas;
+uniform float uAtlasGlyphs;   // glyph count
+uniform float uWake;          // 0..1 wake intensity
+uniform vec3 uBg;
+out vec4 fragColor;
+void main() {
+  // re-stitch reveal: stitch grows top->bottom as sew goes 0->1
+  float reveal = smoothstep(vUv.y - 0.08, vUv.y, vSew);
+  // sheen: top-left light, bottom-right edge shade (their edgeShade)
+  float shade = 1.16 - 0.30 * vUv.y - 0.16 * vUv.x;
+  // thread ply: vertical fiber bands (their ply/plyFreq)
+  float ply = 1.0 + 0.05 * sin(vUv.y * 26.0 + vRand);
+  vec3 col = vColor * shade * ply;
+  // glyph overlay (ASCII texture) — 0.35 alpha so the color keeps the image
+  float gw = 1.0 / uAtlasGlyphs;
+  vec2 guv = vec2(vGlyph * gw + vUv.x * gw, vUv.y);
+  float g = texture(uAtlas, guv).r;
+  col = mix(col, col * (0.78 + 0.22 * (1.0 - g)), g * 0.35);
+  // wake: brightness lift when pointer enters
+  col *= 0.88 + 0.14 * uWake;
+  // 3D sprout under the pointer: brighten, deepen contrast, pop sheen, cast shadow
+  float liftEff = vLift * vRuff;
+  col *= 1.0 + liftEff * 0.20;
+  col = mix(col, pow(max(col, 0.0), vec3(1.22)) * 1.12, liftEff * 0.45);
+  float hi = smoothstep(0.55, 1.0, (1.0 - vUv.x) * (1.0 - vUv.y));
+  col += hi * liftEff * 0.35 * vec3(1.0, 1.0, 0.96);
+  // light from above: shadow falls on the underside/bottom edge of raised tiles
+  col *= 1.0 - liftEff * 0.30 * smoothstep(0.68, 1.0, vUv.y);
+  float sh = smoothstep(0.45, 1.0, vUv.x + vUv.y - 0.25);
+  col *= 1.0 - liftEff * 0.18 * sh;
+  // stitch cell outline for fabric grain
+  float edge = step(0.985, vUv.x) + step(0.985, vUv.y) + step(vUv.x, 0.012) + step(vUv.y, 0.012);
+  col *= 1.0 - edge * 0.18;
+  // tapered ends — only at lift; opaque at rest (no lattice)
+  float endT = smoothstep(0.0, 0.16, vUv.x) * smoothstep(1.0, 0.84, vUv.x);
+  float taper = mix(1.0, endT, vLift * 0.9);
+  fragColor = vec4(col * reveal, taper);
+}`;
+
+function initGL() {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, VS); gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, FS); gl.compileShader(fs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(vs));
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(fs));
+  prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs); gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  instBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  const stride = (2 + 2 + 3 + 1 + 1 + 1 + 1 + 2) * 4;
+  const F = gl.FLOAT;
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, F, false, stride, 0); gl.vertexAttribDivisor(0, 1);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, F, false, stride, 8); gl.vertexAttribDivisor(1, 1);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 3, F, false, stride, 16); gl.vertexAttribDivisor(2, 1);
+  gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 1, F, false, stride, 28); gl.vertexAttribDivisor(3, 1);
+  gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 1, F, false, stride, 32); gl.vertexAttribDivisor(4, 1);
+  gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 1, F, false, stride, 36); gl.vertexAttribDivisor(5, 1);
+  gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 1, F, false, stride, 40); gl.vertexAttribDivisor(6, 1);
+  gl.enableVertexAttribArray(7); gl.vertexAttribPointer(7, 2, F, false, stride, 44); gl.vertexAttribDivisor(7, 1);
+
+  uRes = gl.getUniformLocation(prog, 'uRes');
+  uCell = gl.getUniformLocation(prog, 'uCell');
+  uPtr = gl.getUniformLocation(prog, 'uPtr');
+  uWake = gl.getUniformLocation(prog, 'uWake');
+  uAtlasSize = gl.getUniformLocation(prog, 'uAtlasGlyphs');
+  gl.uniform3f(gl.getUniformLocation(prog, 'uBg'), BG[0] / 255, BG[1] / 255, BG[2] / 255);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uAtlas'), 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, atlasTex);
+  // alpha blending for the tapered leaf ends
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+function uploadInstances() {
+  const n = cols * rows;
+  const stride = 13;
+  const data = new Float32Array(n * stride);
+  for (let i = 0; i < n; i++) {
+    data[i * stride] = basePos[i * 2];
+    data[i * stride + 1] = basePos[i * 2 + 1];
+    data[i * stride + 2] = disp[i * 2];
+    data[i * stride + 3] = disp[i * 2 + 1];
+    data[i * stride + 4] = colors[i * 3];
+    data[i * stride + 5] = colors[i * 3 + 1];
+    data[i * stride + 6] = colors[i * 3 + 2];
+    data[i * stride + 7] = glyphIdx[i];
+    data[i * stride + 8] = sewArr[i];
+    data[i * stride + 9] = rands[i];
+    data[i * stride + 10] = liftArr[i];
+    data[i * stride + 11] = liftOx[i];
+    data[i * stride + 12] = liftOy[i];
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+  if (!instBuf) return;
+  const need = data.byteLength;
+  if (uploadInstances._buf !== instBuf || uploadInstances._alloc < need) {
+    gl.bufferData(gl.ARRAY_BUFFER, Math.max(need, 1) * 2, gl.DYNAMIC_DRAW);
+    uploadInstances._alloc = need * 2;
+    uploadInstances._buf = instBuf;
+  }
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, data);
+}
+
+function render(wake) {
+  const stageErr = (label, fn) => {
+    while (gl.getError());
+    try { fn(); }
+    catch (e) { window.__stageErr = label + ' THREW ' + e.message; showErr(label + ': ' + e.message); return; }
+    const e = gl.getError();
+    if (e) { window.__stageErr = label + ' -> 0x' + e.toString(16); showErr(label + ' -> 0x' + e.toString(16)); }
+  };
+  window.__stageErr = null;
+  gl.useProgram(prog);
+  stageErr('viewport', () => gl.viewport(0, 0, cvs.width, cvs.height));
+  stageErr('clear', () => { gl.clearColor(BG[0] / 255, BG[1] / 255, BG[2] / 255, 1); gl.clear(gl.COLOR_BUFFER_BIT); });
+  stageErr('uniforms', () => {
+    gl.uniform2f(uRes, W, H);           // CSS px — positions are in CSS px
+    gl.uniform1f(uCell, CELL);          // CSS px quad size
+    gl.uniform2f(uPtr, px, py);        // hover bloom center = live pointer
+    gl.uniform1f(uWake, wake);
+    gl.uniform1f(uAtlasSize, GLYPHS.length);
+  });
+  stageErr('draw', () => { gl.bindVertexArray(vao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, cols * rows); });
+  // in-frame ground-truth pixels (valid with preserveDrawingBuffer=false)
+  stageErr('read', () => {
+    // note: gl.readPixels y=0 is the BOTTOM row; convert visual (top-based) -> GL
+    const rd = (fx, fy) => { const p = new Uint8Array(4); gl.readPixels(Math.floor(cvs.width * fx), Math.floor(cvs.height * (1 - fy)) - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p); return Array.from(p); };
+    window.__px = [rd(0.5, 0.2), rd(0.5, 0.48), rd(0.5, 0.75), rd(0.05, 0.05)];
+    // grid-corner ground truth (CSS px -> device px, y flipped)
+    const cw = cvs.width, ch = cvs.height;
+    const corners = [[2, 2], [cols * CELL - 4, 2], [2, rows * CELL - 4], [cols * CELL - 4, rows * CELL - 4]];
+    window.__corners = corners.map(([x, y]) => {
+      const p = new Uint8Array(4);
+      const dx = Math.min(cw - 1, Math.round(x * DPR)), dy = Math.min(ch - 1, ch - 1 - Math.round(y * DPR));
+      gl.readPixels(dx, dy, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p);
+      return { at: [x, y], rgb: Array.from(p.slice(0, 3)) };
+    });
+  });
+}
+
+/* ═══════════ cloth physics (CPU) + exact pointer semantics ═══════════ */
+let px = -9999, py = -9999, prevPX = null, prevPY = null;
+let pVel = { x: 0, y: 0 }, pvSmooth = { x: 0, y: 0 };
+let down = false, pointerActive = false;
+let wakeTarget = 0, wake = 0, lastPointerT = -1;
+let ripples = [];
+let sweepScheduled = false;
+
+window.addEventListener('pointerenter', () => { wakeTarget = 1; });
+window.addEventListener('pointermove', (e) => {
+  px = e.clientX; py = e.clientY; pointerActive = true; wakeTarget = 1;
+  lastPointerT = performance.now();
+  // debug crosshair — hidden in clean mode
+  const dot = document.getElementById('cursor-dot');
+  if (dot && dot.style.display !== 'none') { dot.style.display = 'none'; }
+  if (prevPX !== null) { pVel.x = e.clientX - prevPX; pVel.y = e.clientY - prevPY; }
+  prevPX = e.clientX; prevPY = e.clientY;
+}, { passive: true });
+window.addEventListener('pointerdown', (e) => {
+  down = true; pointerActive = true; lastPointerT = performance.now();
+  ripples.push({ x: e.clientX, y: e.clientY, t0: performance.now() });
+  // click = nothing (Sarvam parity) — the bloom is hover-driven
+}, { passive: true });
+window.addEventListener('pointerup', () => { down = false; }, { passive: true });
+window.addEventListener('pointerleave', () => {
+  pointerActive = false; down = false; wakeTarget = 0;
+  px = -9999; py = -9999; prevPX = null; prevPY = null;
+});
+/* click: NOTHING — verbatim their wrapper (base piece has no onClick action) */
+
+const cellAt = (i) => [i % cols, Math.floor(i / cols)];
+const map = new Map();
+function rebuildMap() { map.clear(); for (let i = 0; i < cols * rows; i++) map.set(i, i); }
+function neigh(i, dc, dr) {
+  const [c, r] = cellAt(i);
+  const nc = c + dc, nr = r + dr;
+  if (nc < 0 || nc >= cols || nr < 0 || nr >= rows) return -1;
+  return nr * cols + nc;
+}
+
+function physicsStep(dt) {
+  const n = cols * rows;
+  const damp = Math.exp(-DAMP * dt);
+  const swx = -pvSmooth.y * SWIRL, swy = pvSmooth.x * SWIRL;
+  const now = performance.now();
+  const active = pointerActive;
+
+  // ripples: gentle expanding ring (press), not a burst
+  ripples = ripples.filter(rp => now - rp.t0 < RIPPLE_LIFE * 1000);
+  const ripForces = [];
+  for (const rp of ripples) {
+    const age = (now - rp.t0) / 1000;
+    const ringR = age * RIPPLE_SPEED;
+    ripForces.push({ x: rp.x, y: rp.y, r: ringR });
+  }
+
+  for (let i = 0; i < n; i++) {
+    const bx = basePos[i * 2], by = basePos[i * 2 + 1];
+    const dx = disp[i * 2], dy = disp[i * 2 + 1];
+    const x = bx + dx, y = by + dy;
+    let fx = -dx * SPRING_HOME;
+    let fy = -dy * SPRING_HOME;
+    let dvx = 0, dvy = 0;
+    for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const j = neigh(i, dc, dr);
+      if (j >= 0) {
+        fx += (disp[j * 2] - dx) * SPRING_EDGE;
+        fy += (disp[j * 2 + 1] - dy) * SPRING_EDGE;
+        dvx += (vel[j * 2] - vel[i * 2]) * EDGE_DAMP;
+        dvy += (vel[j * 2 + 1] - vel[i * 2 + 1]) * EDGE_DAMP;
+      }
+    }
+    let vx = (vel[i * 2] + (fx) * dt + dvx * dt) * damp;
+    let vy = (vel[i * 2 + 1] + (fy) * dt + dvy * dt) * damp;
+
+    // pointer: press (down) + stir (move), radius 80 — their semantics
+    if (active && px > -999) {
+      const dpx = x - px, dpy = y - py;
+      const dp2 = dpx * dpx + dpy * dpy;
+      if (dp2 < RADIUS * RADIUS) {
+        const dp = Math.sqrt(dp2) || 1;
+        const f = Math.pow(1 - dp / RADIUS, 1.5);
+        vx += (pvSmooth.x + swx) * f * BLEND_INJECT;
+        vy += (pvSmooth.y + swy) * f * BLEND_INJECT;
+        if (down && dp > 2) { vx += (dpx / dp) * f * 20; vy += (dpy / dp) * f * 20; }
+      }
+    }
+    // ripple ring impulse
+    for (const rf of ripForces) {
+      const rdx = x - rf.x, rdy = y - rf.y;
+      const d = Math.sqrt(rdx * rdx + rdy * rdy);
+      const band = Math.abs(d - rf.r);
+      if (band < 14) {
+        const f = (1 - band / 14) * RIPPLE_AMP;
+        vx += (rdx / (d || 1)) * f;
+        vy += (rdy / (d || 1)) * f;
+      }
+    }
+
+    const sp = Math.hypot(vx, vy);
+    if (sp > V_MAX) { vx *= V_MAX / sp; vy *= V_MAX / sp; }
+    vel[i * 2] = vx; vel[i * 2 + 1] = vy;
+    disp[i * 2] += vx * dt;
+    disp[i * 2 + 1] += vy * dt;
+
+    // hover bloom: lift = pointer proximity; petals sprout outward from the
+    // CURSOR (organized starburst), pitch up in 3D, then relax as you leave.
+    let liftT = 0, outX = 0, outY = 0;
+    if (pointerActive && px > -999) {
+      const lx = x - px, ly = y - py;
+      const ld = Math.sqrt(lx * lx + ly * ly);
+      if (ld < RADIUS) {
+        liftT = Math.pow(1 - ld / RADIUS, 2);
+        const od = 4.5 * liftT;
+        outX = (ld > 0.5 ? lx / ld : 0) * od;
+        outY = (ld > 0.5 ? ly / ld : 0) * od;
+      }
+    }
+    if (liftT > 0.001) liftT *= 0.6 + 0.4 * Math.abs(Math.sin(rands[i] * 3.7 + 1.3));
+    const lk = Math.min(1, dt * 12);
+    liftArr[i] += (liftT - liftArr[i]) * lk;
+    liftOx[i] += (outX - liftOx[i]) * lk;
+    liftOy[i] += (outY - liftOy[i]) * lk;
+
+    // dirty for re-stitch — ONLY once the pointer has gone (never blacken while touching)
+    const d2 = disp[i * 2] * disp[i * 2] + disp[i * 2 + 1] * disp[i * 2 + 1];
+    if (d2 > 25 && sewArr[i] === 1 && !pointerActive) { sewArr[i] = 0; sweepScheduled = true; }
+  }
+  pvSmooth.x += (pVel.x - pvSmooth.x) * 0.35;
+  pvSmooth.y += (pVel.y - pvSmooth.y) * 0.35;
+  pVel.x *= 0.8; pVel.y *= 0.8;
+}
+
+let vel = null;
+function maybeSweep(now) {
+  if (!sweepScheduled) return;
+  if (now - lastPointerT < 120) return;
+  sweepScheduled = false;
+  for (let i = 0; i < cols * rows; i++) {
+    if (sewArr[i] === 0) {
+      const c = i % cols;
+      cells[i].sewStart = now + c * SEW_STAGGER * 1000 + (Math.floor(i / cols) % 3) * 8;
+    }
+  }
+}
+function advanceSew(now) {
+  for (let i = 0; i < cols * rows; i++) {
+    if (sewArr[i] < 1 && cells[i].sewStart > 0) {
+      const t = (now - cells[i].sewStart) / (SEW_DURATION * 1000);
+      if (t >= 1) sewArr[i] = 1;
+      else { const e = 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3); sewArr[i] = e; }
+    }
+  }
+}
+
+/* ═══════════ main loop ═══════════ */
+let lastT = performance.now();
+function loop(now) {
+  loop._lastTick = now;
+  const dt = Math.min(0.033, (now - lastT) / 1000);
+  lastT = now;
+  // hard guarantee: if the container size drifted, re-layout before simulating
+  const [cw, ch] = currentSize();
+  if (cw !== W || ch !== H) resize();
+  physicsStep(dt * 0.5); physicsStep(dt * 0.5);
+  maybeSweep(now);
+  advanceSew(now);
+  wake += (wakeTarget - wake) * Math.min(1, dt * 5);
+  uploadInstances();
+  render(wake);
+  requestAnimationFrame(loop);
+}
+setInterval(() => {
+  const now = performance.now();
+  if (!loop._lastTick || now - loop._lastTick > 250) loop(now);
+}, 100);
+
+/* ═══════════ init / resize (pane-safe: ResizeObserver + poll, not just window resize) ═══════════ */
+let W = 0, H = 0, DPR = 1;
+function currentSize() {
+  const de = document.documentElement;
+  return [de.clientWidth || window.innerWidth, de.clientHeight || window.innerHeight];
+}
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  const [cw, ch] = currentSize();
+  W = cw; H = ch;
+  cvs.width = Math.round(W * DPR); cvs.height = Math.round(H * DPR);
+  cols = Math.ceil(W / CELL);
+  rows = Math.ceil(H / CELL);
+  genArt(20260902);
+  vel = new Float32Array(cols * rows * 2);
+  rebuildMap();
+  uploadInstances();
+}
+window.addEventListener('resize', resize);
+let _lastCW = 0, _lastCH = 0;
+function checkSize() {
+  const [cw, ch] = currentSize();
+  if (cw !== _lastCW || ch !== _lastCH) { _lastCW = cw; _lastCH = ch; resize(); }
+  // live viewport readout in the HUD title (diagnostic)
+  const t = document.querySelector('.hud .title');
+  if (t) {
+    const h = window.__hover ? window.__hover() : null;
+    t.textContent = h && h.px > -900 ? `v6 · ptr ${h.px},${h.py} · cell ${h.cell} · sew ${h.sew} · lift ${h.lift}` : 'v6 · ascii cloth — sarvam-exact';
+  }
+  // cyan outline of the grid's claimed extent (hidden in clean mode)
+  const o = document.getElementById('grid-outline');
+  if (o) o.style.display = 'none';
+}
+checkSize();
+if (window.ResizeObserver) new ResizeObserver(checkSize).observe(document.documentElement);
+setInterval(checkSize, 500);
+
+document.getElementById('reset').onclick = () => { disp.fill(0); vel.fill(0); sewArr.fill(1); ripples.length = 0; };
+
+const glyphCount = buildAtlas();
+if (gl) {
+  try { initGL(); }
+  catch (e) { showErr('renderer init failed: ' + e.message); }
+}
+
+if (gl && document.fonts && document.fonts.ready) {
+  let started = false;
+  const start = () => {
+    if (started || !gl) return;
+    started = true;
+    buildAtlas();      // glyphs now drawn with the real font
+    resize();
+    requestAnimationFrame(loop);
+  };
+  document.fonts.ready.then(start);
+  setTimeout(start, 900);   // fonts.ready can hang in throttled/headless tabs
+} else if (gl) {
+  buildAtlas();
+  resize();
+  requestAnimationFrame(loop);
+}
+
+/* test hooks */
+window.__loop = loop;
+window.__hover = () => { const i = Math.max(0, Math.min(cols * rows - 1, (Math.floor(py / CELL)) * cols + Math.floor(px / CELL))); return { px: Math.round(px), py: Math.round(py), cell: i, sew: sewArr[i], lift: +liftArr[i].toFixed(2) }; };
+
+/* auto-hover test mode: ?autohover=x,y dispatches a pointermove after load (headless testing) */
+try {
+  const ah = new URLSearchParams(location.search).get('autohover');
+  if (ah) {
+    const [ax, ay] = ah.split(',').map(Number);
+    setTimeout(() => {
+      window.dispatchEvent(new PointerEvent('pointermove', { clientX: ax, clientY: ay, bubbles: true, pointerId: 1, pointerType: 'mouse' }));
+    }, 1500);
+  }
+} catch (e) {}
+
+window.__sizeInfo = () => [W, H, cols, rows];
+window.__dbg = () => ({ cols, rows, n: cols * rows, glerr: gl.getError(), alloc: uploadInstances._alloc || 0, sew0: (() => { let z = 0; for (let i = 0; i < sewArr.length; i++) if (sewArr[i] < 0.5) z++; return z; })(), c0: [colors[0], colors[1], colors[2]] });
+window.__active = () => { let m = 0; for (let i = 0; i < cols * rows; i++) { const d = Math.hypot(disp[i * 2], disp[i * 2 + 1]); if (d > m) m = d; } return m; };
+window.__stir = (x0, y0, x1, y1, steps) => {
+  const ev = (x, y) => window.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse' }));
+  for (let i = 0; i <= steps; i++) ev(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+};
+window.__press = (x, y) => {
+  window.dispatchEvent(new PointerEvent('pointerdown', { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse' }));
+  setTimeout(() => window.dispatchEvent(new PointerEvent('pointerup', { clientX: x, clientY: y, bubbles: true, pointerId: 1, pointerType: 'mouse' })), 300);
+  return 'pressed';
+};
+})();
+</script>
+</body>
+</html>
